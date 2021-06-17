@@ -1,0 +1,273 @@
+---
+title: "Data Science Captone Project: Milestone Report"
+author: "Lina G"
+date: "09/06/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries,warning=FALSE,message=FALSE,include=FALSE,echo=FALSE}
+library(downloader)
+library(tm)
+library(knitr)
+library(stringi)
+library(stringr)
+
+library(dplyr)
+library(ggplot2)
+library(NLP)
+options(java.parameters = "-Xmx2048m")
+library(tidytext)
+library(RWeka)
+library(ngram)
+library(corpus)
+library(wordcloud)
+```
+
+# Introduction
+
+The goal of this project is to do text mining and exploratory analysis to prepare for the final data science capstone project, where the aim is to create a next word prediction algorithm. This document is used to overview the major features of the data and briefly summarize the plans for creating the prediction algorithm and Shiny app.
+There are three data sources in English language: blogs, news and twitter. 
+
+# Reading and sampling data
+
+There are three data sources in English language: blogs, news and twitter. Three files are read to one list and an overview of all files is produced. Twitter has the highest number of lines - over 2 million, while blogs have the highest number of words - over 37 million.
+```{r datasources,warning=FALSE,include=FALSE,echo=FALSE, cache = TRUE}
+# URLs for downloading the data files
+data_url <- "https://d396qusza40orc.cloudfront.net/dsscapstone/dataset/Coursera-SwiftKey.zip"
+if (!file.exists("swiftkey.zip")){
+  download(url = data_url, dest = "swiftkey.zip", mode="wb")
+  unzip ("swiftkey.zip", exdir = "./")
+}
+#list.files( recursive = TRUE)
+filenames <- list.files(pattern = "en_US(.*?)txt$", recursive = TRUE)
+#file_names <-gsub(pattern = "final/(de_DE/|en_US/|fi_FI/|ru_RU/)|\\.txt", replacement = "", x = filenames)
+file_names <-gsub(pattern = "final/en_US/en_US.|\\.txt", replacement = "", x = filenames)
+
+```
+
+```{r, warning=FALSE,message=FALSE,include=FALSE,echo=FALSE}
+#read files into a character vector
+files <- lapply(filenames,readLines)
+names(files) <-file_names
+#closeAllConnections()
+rm(filenames)
+```
+
+```{r,warning=FALSE,echo=FALSE, cache = TRUE}
+overview <- data.frame(
+  file_name=names(files),
+  "file_size" = sapply(files, function(x){format(object.size(x),"MB")}),
+  'number_of_lines' = sapply(files, function(x){length(x)}),
+  'number_of_characters' = sapply(files, function(x){sum(nchar(x))}),
+  'number_of_words' = sapply(files, function(x){sum(stri_count_words(x))}), #from library stringi
+  'longest_entry' = sapply(files, function(x){max(unlist(lapply(x, function(y) nchar(y))))})
+)
+kable(overview,caption = "the overview of US datasets")
+```
+
+As the size of each dataset is very big, we will use sampled data for the analysis and building the prediction algorithm. The 1% sample size is selected, corpus is created and then cleaned by removing non-ASCII characters, urls, numbers, punctuation, extra white spaces, converting all letters to lower case and creating plain text format.
+
+```{r, warning=FALSE,message=FALSE,include=FALSE,echo=FALSE, cache = TRUE}
+set.seed(54321)
+sampled <- sapply(files, function(x){sample(x,size=0.01*length(x), replace=FALSE)}) # Sampling
+
+sampled <- sapply(sampled, function(x){iconv(x, "latin1", "ASCII", sub = "")}) # Remove non-ASCII characters
+
+
+create_corpus <- function (x) { #Create a function to get the cleaned corpus
+  temp <- VCorpus(VectorSource(x),readerControl = list(language = "en"))
+  temp <- tm_map(temp, removeNumbers)
+  temp <- tm_map(temp, removePunctuation)
+  temp <- tm_map(temp, content_transformer(tolower)) # Convert to lowercase
+  temp <- tm_map(temp, content_transformer(function(x) gsub("http[[:alnum:]]*", "", x))) # remove urls
+  temp <- tm_map(temp, removeWords,stopwords("english")) # Remove english stop words
+#  temp <- tm_map(temp, stemDocument)
+  temp <- tm_map(temp, stripWhitespace)  
+  temp <- tm_map(temp, PlainTextDocument)
+}
+corp <- create_corpus(sampled) # Create a separate corpus for each source (blog, news and twitter
+corp_unlist <- create_corpus(unlist(sampled)) # Create one corpus for all text
+names(corp)<-names(sampled)
+```
+
+# Building N-grams
+
+In Natural Language Processing, n-gram is a continuous sequence of n items from a given sequence of text. We are going to create one (unigrams), two (bigrams), three (trigrams) and four (quadgrams) words combinations using RWeka package. We are going to create n-grams for one combined dictionary as well as three separate ones (for blogs, news and twitter) as words and phrases might differ depending on the text source. 
+
+```{r, warning=FALSE, cache = TRUE}
+CreateNgram <- function(corp, n){
+    Tokenizer <- function(x) NGramTokenizer(x, Weka_control(min = n, max = n))
+    nGram <-  TermDocumentMatrix(corp, control = list(tokenize = Tokenizer))
+}
+
+nGram1_comb <- CreateNgram(corp_unlist,1)
+nGram2_comb <- CreateNgram(corp_unlist,2)
+nGram3_comb <- CreateNgram(corp_unlist,3)
+nGram4_comb <- CreateNgram(corp_unlist,4)
+
+nGram1<-list()
+nGram2<-list()
+nGram3<-list()
+nGram4<-list()
+for (i in 1:length(corp)){
+   nGram1[[i]] <- CreateNgram(corp[i],1)
+   nGram2[[i]] <- CreateNgram(corp[i],2)
+   nGram3[[i]] <- CreateNgram(corp[i],3)
+   nGram4[[i]] <- CreateNgram(corp[i],4)
+}
+```
+
+```{r,warning=FALSE,echo=FALSE, cache = TRUE}
+save(nGram1,file="tdm1.RData")
+save(nGram2,file="tdm2.RData")
+save(nGram3,file="tdm3.RData")
+save(nGram4,file="tdm4.RData")
+```
+
+We then find the frequency of terms in each of these n-grams and construct dataframes of these frequencies.
+```{r,warning=FALSE, cache = TRUE}
+TopFreq <- function(x, lowlimit=10){
+    topFreq<- x[findFreqTerms(x,lowlimit),]%>%
+    as.matrix() %>%
+    rowSums()  %>% sort(decreasing=TRUE)        
+}
+
+freq1<-TopFreq(nGram1_comb,100)
+freq2<-TopFreq(nGram2_comb,10)
+freq3<-TopFreq(nGram3_comb,3)
+freq4<-TopFreq(nGram4_comb,2)
+
+freq1_split<-sapply(nGram1, function(x){TopFreq(x,100)})
+freq2_split<-sapply(nGram2, function(x){TopFreq(x,10)})
+freq3_split<-sapply(nGram3, function(x){TopFreq(x,3)})
+freq4_split<-sapply(nGram4, function(x){TopFreq(x,2)})
+names(freq1_split)<-names(corp)
+names(freq2_split)<-names(corp)
+names(freq3_split)<-names(corp)
+names(freq4_split)<-names(corp)
+```
+
+# Exploratory Analysis & Visualizations
+
+Wordclouds and histograms are plotted for most common words and phrases in unigrams, bigrams, trigrams and quadgrams.
+
+## Word Clouds
+
+```{r,echo=FALSE,warning=FALSE}
+# Set plot layout
+layout(mat = matrix(c(1, 2, 3, 4), nrow = 2, ncol = 2),
+       heights = c(5, 5),    # Heights of the two rows
+       widths = c(8, 8))     # Widths of the two columns
+
+wordcloud(names(freq1), freq1, max.words=40, random.order=FALSE, rot.per=0.3, scale=c(3, .01), colors=brewer.pal(12, "Paired"))
+
+wordcloud(names(freq4), freq4, max.words=20, random.order=TRUE, scale=c(1.5, .01), colors=brewer.pal(12, "Paired"))
+
+wordcloud(names(freq3), freq3, max.words=20, random.order=TRUE, rot.per=0.2, scale=c(1.5, .01), colors=brewer.pal(12, "Paired"))
+
+wordcloud(names(freq2), freq2, max.words=30, random.order=TRUE, rot.per=0.2, scale=c(2.5, .01), colors=brewer.pal(12, "Paired"))
+
+
+```
+
+## Histograms
+
+```{r,echo=FALSE,warning=FALSE}
+HistPlot <- function(f, title_name){
+   f<-data.frame(words=names(f),frequency=f)
+   g<- ggplot(f,aes(x=reorder(words,-frequency),y=frequency))
+   g<- g+geom_bar(stat="identity")
+   g<- g+labs(title=title_name,x="Words",y="Frequency")
+   g<- g+theme(axis.text.x=element_text(angle=90))
+   g
+}
+```
+
+```{r,echo=FALSE,warning=FALSE}
+#require(gridExtra)
+layout(mat = matrix(c(1, 2, 3, 4), nrow = 2, ncol = 2),
+       heights = c(5, 5),    # Heights of the two rows
+       widths = c(8, 8))     # Widths of the two columns
+
+HistPlot(freq1[1:20],"Unigrams")
+HistPlot(freq2[1:20],"Bigrams")
+HistPlot(freq3[1:20],"Trigrams")
+HistPlot(freq4[1:20],"Quadgrams")
+#grid.arrange(h1, h2, h3, h4, nrow = 2)
+```
+Histograms are also plotted for most common words and phrases in unigrams, bigrams, trigrams and quadgrams by text source - blogs, news and twitter. We can see that most common words differe significantly depending on text source.
+
+```{r,echo=FALSE,warning=FALSE,message=FALSE}
+require(reshape2)
+
+HistPlotSplit <- function(split=freq1_split, num=10, title_name="Unigram"){
+   ftop<-lapply(split, function(l) l[1:num])
+   h <- data.frame(source = rep(names(ftop), sapply(ftop, length)),
+                    words = melt(sapply(ftop, names))$value, 
+            frequency=do.call('c', unname(ftop)))
+  
+   g <- ggplot(data = h, aes(x = words, y = frequency, fill = source))
+   g<- g + geom_bar(stat = 'identity', position = 'dodge') +  facet_grid(~source)
+   g<- g+labs(title=title_name,x="Words",y="Frequency")
+   g<- g+theme(axis.text.x=element_text(angle=90))
+   g
+  
+}
+HistPlotSplit(freq1_split, num=10,"Unigram")
+HistPlotSplit(freq2_split, num=10,"Bigram")
+HistPlotSplit(freq3_split, num=10,"Trigram")
+HistPlotSplit(freq4_split, num=10,"Quadgram")
+
+```
+
+## Frequencies
+
+The histograms show that the distribution of words is very skewed. We are going to look into how many most frequent words we need to cover the 50% and 90% of all word instances.
+
+```{r,warning=FALSE,message=FALSE}
+FreqMatrix <- function(x,ng,cov_ratio=0.5){
+        myTdm <- as.matrix(x)
+        FreqMat <- data.frame(word = rownames(myTdm), 
+                      Freq = rowSums(myTdm), 
+                      row.names = NULL)
+        FreqMat <- FreqMat[order(FreqMat[,2], decreasing = TRUE),]
+        cover <-  FreqMat %>% mutate(proportion = Freq / sum(Freq)) %>%
+                        arrange(desc(proportion)) %>%  
+                        mutate(coverage = cumsum(proportion)) %>%
+                        filter(coverage <= cov_ratio)
+        cat(sprintf("We will need %d unique words and %d phrases to cover %1.0f%% of phrases in a %d-gram\n",length(unique(unlist(str_split(cover$word, ' ')))),nrow(cover),cov_ratio*100,ng))
+cover
+
+}
+```
+
+```{r,warning=FALSE,message=FALSE, echo=FALSE}
+unigramCov50 <- FreqMatrix(freq1, 1,0.5)
+unigramCov90 <- FreqMatrix(freq1, 1,0.9)
+bigramCov50 <- FreqMatrix(freq2, 2,0.5)
+bigramCov90 <- FreqMatrix(freq2, 2,0.9)
+trigramCov50 <- FreqMatrix(freq3, 3,0.5)
+trigramCov90 <- FreqMatrix(freq3, 3,0.9)
+quadgramCov50 <- FreqMatrix(freq4, 4,0.5)
+quadgramCov90 <- FreqMatrix(freq4, 4,0.9)
+```
+In order to save memory, we are going to use only words that are enough to cover 90% of all word instances and n-grams created using those words.
+
+# Prediction Model
+
+We are going to use the n-grams for prediction. The model will find the n-gram with the greatest frequency given the word or a phrase provided for prediction. An example if two words are given for prediction is provided below if we use trigram. If there are no matches, we will use n-1-gram for prediction or choose a random word. We will also consider having an input for text source or type to predict the next word as it might vary depending on the text type.
+
+```{r,echo=FALSE,warning=FALSE,message=FALSE}
+library(tidyr)
+trigram_separated <-trigramCov90 %>%
+  separate(word, c("word1", "word2", "word3"), sep = " ")
+head(trigram_separated)
+```
+
+# Conclusion & Next Steps
+
+Next Steps are going to build a predictive algorithm and a Shiny app, that suggests the most likely next word after a phrase is typed. We are going to use n-grams we have created for prediction as discussed in the prediction section. In order to optimize the model and save memory, we will use only words that would cover 90% of all word instances and will consider having an input for data source as well.
